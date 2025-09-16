@@ -49,14 +49,17 @@
 
 ### 依赖安装
 ```bash
-# 基础依赖
+# 核心依赖（必需）
 pip install pygame pillow numpy
 
-# 可选依赖（用于多显示器支持）
-pip install screeninfo
+# 可选依赖
+pip install screeninfo  # 多显示器支持
+pip install pywebview   # 混合模式支持
+```
 
-# Web模式依赖（可选）
-pip install flask flask-socketio pywebview
+或者直接安装所有依赖：
+```bash
+pip install -r requirements.txt
 ```
 
 ### 安装步骤
