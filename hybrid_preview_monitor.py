@@ -46,6 +46,11 @@ class HybridPreviewMonitor:
     _port = 5060
     _image_cache = {}
     
+    # 新增：队列数据结构
+    _display_queue = []  # 存储显示队列数据
+    _image_index_map = {}  # 索引到图片信息的映射 {index: {image: url, display_mode: str, compare_image: url}}
+    _next_index = 1  # 下一个可用的索引（从1开始）
+    
     @classmethod
     def get_monitors(cls):
         """Get available monitors"""
@@ -100,14 +105,29 @@ class HybridPreviewMonitor:
         """Define input types for ComfyUI"""
         monitor_list = cls.get_monitors()
         target_resolutions = cls.get_target_resolutions()
+        
+        # Get default resolution from first monitor
+        default_resolution = target_resolutions[0] if target_resolutions else "1920x1080"
+        try:
+            # Extract resolution from first monitor name
+            if monitor_list and len(monitor_list) > 0:
+                monitor_name = monitor_list[0]
+                # Extract resolution from monitor name like "Monitor 0 (1920x1080)"
+                import re
+                match = re.search(r'\((\d+x\d+)\)', monitor_name)
+                if match:
+                    default_resolution = match.group(1)
+        except Exception:
+            pass
+        
         return {
             "required": {
                 "images": ("IMAGE",),
+                "mode": (["new", "append"], {"default": "new"}),
                 "monitor": (monitor_list, {"default": monitor_list[0]}),
                 "power_state": (["On", "Off"], {"default": "On"}),
-                "display_mode": (["single", "comparison", "slideshow"], {"default": "single"}),
                 "fit_mode": (["none", "width", "height", "fit", "fill", "distort", "center"], {"default": "fit"}),
-                "target_resolution": (target_resolutions, {"default": target_resolutions[0]}),
+                "target_resolution": (target_resolutions, {"default": default_resolution}),
                 "gain": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1}),
                 "gamma": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1}),
                 "saturation": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1}),
@@ -157,9 +177,11 @@ class HybridPreviewMonitor:
                         self.send_response(200)
                         self.send_header('Content-type', 'image/png')
                         self.end_headers()
-                        img_data = cls._image_cache[image_id]['data']
-                        img_bytes = base64.b64decode(img_data)
-                        self.wfile.write(img_bytes)
+                        # 直接从PIL Image转换为字节
+                        pil_img = cls._image_cache[image_id]
+                        buffer = BytesIO()
+                        pil_img.save(buffer, format='PNG')
+                        self.wfile.write(buffer.getvalue())
                     else:
                         self.send_response(404)
                         self.end_headers()
@@ -632,7 +654,133 @@ class HybridPreviewMonitor:
         return img_id
     
     @classmethod
-    def display_image(cls, images, monitor=0, power_state="On", display_mode="single", 
+    def _add_to_queue(cls, images, compare_images=None, mode="new", display_mode="simple"):
+        """添加图片到显示队列"""
+        if mode == "new":
+            # 清空现有队列
+            cls._display_queue.clear()
+            cls._image_index_map.clear()
+            cls._next_index = 1
+        
+        # 处理图片数据
+        processed_images = []
+        try:
+            images_list = list(images) if hasattr(images, '__iter__') else [images]
+            for image in images_list:
+                img_id = cls._process_image(image)
+                processed_images.append(img_id)
+        except Exception as e:
+            print(f"❌ [ERROR] Error processing images: {e}")
+            return
+        
+        # 处理比较图片
+        processed_compare = []
+        if compare_images is not None:
+            try:
+                compare_list = list(compare_images) if hasattr(compare_images, '__iter__') else [compare_images]
+                for image in compare_list:
+                    img_id = cls._process_image(image)
+                    processed_compare.append(img_id)
+            except Exception as e:
+                print(f"❌ [ERROR] Error processing compare images: {e}")
+                processed_compare = []
+        
+        # 检查是否重复（基于图片ID）
+        if mode == "append":
+            # 检查是否与最后一项重复
+            if cls._display_queue:
+                last_item = cls._display_queue[-1]
+                if (last_item.get("images") == processed_images and 
+                    last_item.get("compare_images") == processed_compare and
+                    last_item.get("display_mode") == display_mode):
+                    print(f"🔍 [DEBUG] Duplicate data detected, skipping append")
+                    return
+        
+        # 创建新的队列项
+        queue_item = {
+            "display_mode": display_mode,
+            "images": processed_images
+        }
+        
+        if processed_compare:
+            queue_item["compare_images"] = processed_compare
+        
+        # 添加到队列
+        cls._display_queue.append(queue_item)
+        
+        # 更新索引映射
+        added_indices = []  # 记录添加的索引
+        
+        if display_mode == "comparison" and processed_compare:
+            # 比较模式：只创建一个索引，包含主图片和比较图片
+            cls._image_index_map[cls._next_index] = {
+                "image": processed_images[0] if processed_images else None,
+                "compare_image": processed_compare[0] if processed_compare else None,
+                "display_mode": "comparison"
+            }
+            added_indices.append(cls._next_index)
+            cls._next_index += 1
+        else:
+            # 简单模式：为每张图片创建索引
+            for img_id in processed_images:
+                cls._image_index_map[cls._next_index] = {
+                    "image": img_id,
+                    "display_mode": display_mode
+                }
+                added_indices.append(cls._next_index)
+                cls._next_index += 1
+        
+        print(f"✅ [DEBUG] Added to queue: {len(processed_images)} images, mode: {display_mode}")
+        print(f"🔍 [DEBUG] Queue length: {len(cls._display_queue)}, Index map size: {len(cls._image_index_map)}")
+        print(f"🔍 [DEBUG] Added indices: {added_indices}")
+        
+        # 返回最新添加的索引（最后一张图片的索引）
+        return added_indices[-1] if added_indices else None
+    
+    @classmethod
+    def _get_current_display_data(cls):
+        """获取当前显示数据"""
+        if not cls._display_queue:
+            return None, None, "simple"
+        
+        # 返回第一个队列项的数据
+        first_item = cls._display_queue[0]
+        images = first_item.get("images", [])
+        compare_images = first_item.get("compare_images", [])
+        display_mode = first_item.get("display_mode", "simple")
+        
+        return images, compare_images, display_mode
+    
+    @classmethod
+    def _get_image_by_index(cls, index):
+        """根据索引获取图片信息"""
+        if index in cls._image_index_map:
+            return cls._image_index_map[index]
+        return None
+    
+    @classmethod
+    def _get_next_image_index(cls, current_index, direction=1):
+        """获取下一张图片的索引"""
+        if not cls._image_index_map:
+            return current_index
+        
+        indices = sorted(cls._image_index_map.keys())
+        if not indices:
+            return current_index
+        
+        try:
+            current_pos = indices.index(current_index)
+            if direction > 0:  # 下一张
+                next_pos = (current_pos + 1) % len(indices)
+            else:  # 上一张
+                next_pos = (current_pos - 1) % len(indices)
+            return indices[next_pos]
+        except ValueError:
+            # 如果当前索引不存在，返回第一个索引
+            return indices[0]
+    
+    @classmethod
+    def display_image(cls, images, mode="new", monitor=0, power_state="On", 
                      fit_mode="fit", target_resolution="1920x1080", 
                      gain=1.0, gamma=1.0, saturation=1.0, white_matte=False, 
                      fps_mode="smart", compare_images=None):
@@ -664,27 +812,21 @@ class HybridPreviewMonitor:
                 print("❌ [ERROR] Failed to start web server")
                 return (images,)
         
-        # Process images
-        processed_images = []
-        try:
-            images_list = list(images) if hasattr(images, '__iter__') else [images]
-            for i, image in enumerate(images_list):
-                img_id = cls._process_image(image)
-                processed_images.append(img_id)
-        except Exception as e:
-            print(f"❌ [ERROR] Error processing images: {e}")
-            return (images,)
+        # 确定显示模式
+        if compare_images is not None and len(compare_images) > 0:
+            display_mode = "comparison"
+        else:
+            display_mode = "simple"
         
-        compare_processed = []
-        if compare_images is not None:
-            try:
-                compare_list = list(compare_images) if hasattr(compare_images, '__iter__') else [compare_images]
-                for i, image in enumerate(compare_list):
-                    img_id = cls._process_image(image)
-                    compare_processed.append(img_id)
-            except Exception as e:
-                print(f"❌ [ERROR] Error processing compare images: {e}")
-                compare_processed = []
+        # 添加到队列并获取最新索引
+        latest_index = cls._add_to_queue(images, compare_images, mode, display_mode)
+        
+        # 获取当前显示数据
+        processed_images, compare_processed, current_display_mode = cls._get_current_display_data()
+        
+        if not processed_images:
+            print("❌ [ERROR] No images to display")
+            return (images,)
         
         # Extract monitor index from monitor string
         try:
@@ -698,7 +840,7 @@ class HybridPreviewMonitor:
         
         # Prepare settings
         settings = {
-            'display_mode': display_mode,
+            'display_mode': current_display_mode,
             'fit_mode': fit_mode,
             'target_resolution': target_resolution,
             'gain': gain,
@@ -716,26 +858,36 @@ class HybridPreviewMonitor:
         # Check existing windows
         # Create or update window
         if monitor_idx not in cls._windows:
-            cls._create_hybrid_window(monitor_idx, processed_images, compare_processed, settings)
+            print(f"🔍 [DEBUG] Creating new window for monitor {monitor_idx}")
+            cls._create_hybrid_window(monitor_idx, settings, latest_index)
         else:
-            # Update existing window data
-            with cls._windows[monitor_idx]["lock"]:
-                cls._windows[monitor_idx]["images"] = processed_images
-                cls._windows[monitor_idx]["compare_images"] = compare_processed
-                cls._windows[monitor_idx]["settings"] = settings
-                # Force window to refresh by resetting current index
-                cls._windows[monitor_idx]["current_idx"] = 0
-                cls._windows[monitor_idx]["refresh_needed"] = True
+            # Check if existing window is still alive
+            if cls._windows[monitor_idx]["thread"].is_alive():
+                print(f"🔍 [DEBUG] Updating existing window for monitor {monitor_idx}")
+                # Update existing window data
+                with cls._windows[monitor_idx]["lock"]:
+                    cls._windows[monitor_idx]["settings"] = settings
+                    cls._windows[monitor_idx]["current_idx"] = latest_index  # 更新到最新索引
+                    # Force window to refresh
+                    cls._windows[monitor_idx]["refresh_needed"] = True
+                print(f"✅ [DEBUG] Window data updated for monitor {monitor_idx}, current_idx: {latest_index}")
+                print(f"🔍 [DEBUG] Forcing window refresh...")
+            else:
+                print(f"🔍 [DEBUG] Existing window thread is dead, creating new window for monitor {monitor_idx}")
+                # Clean up dead window data
+                del cls._windows[monitor_idx]
+                # Create new window
+                cls._create_hybrid_window(monitor_idx, settings, latest_index)
         
         return (images,)
     
     @classmethod
-    def _create_hybrid_window(cls, monitor_idx, images, compare_images, settings):
+    def _create_hybrid_window(cls, monitor_idx, settings, latest_index=None):
         """Create a hybrid window - uses Pygame with enhanced features"""
-        cls._create_pygame_fallback(monitor_idx, images, compare_images, settings)
+        cls._create_pygame_fallback(monitor_idx, settings, latest_index)
     
     @classmethod
-    def _create_pygame_fallback(cls, monitor_idx, images, compare_images, settings):
+    def _create_pygame_fallback(cls, monitor_idx, settings, latest_index=None):
         """Enhanced Pygame window with hybrid features"""
         
         if not PYGAME_AVAILABLE:
@@ -750,10 +902,6 @@ class HybridPreviewMonitor:
                 # Force initialization of all closure variables - ensure they're always defined
                 if 'settings' not in locals() or settings is None:
                     settings = {}
-                if 'images' not in locals() or images is None:
-                    images = []
-                if 'compare_images' not in locals() or compare_images is None:
-                    compare_images = []
                 
                 # Get target resolution from settings
                 target_resolution = settings.get('target_resolution', '1920x1080')
@@ -781,10 +929,123 @@ class HybridPreviewMonitor:
                 screen = pygame.display.set_mode((width, height), pygame.RESIZABLE)
                 pygame.display.set_caption(f'Hybrid Preview Monitor {monitor_idx} (Enhanced Pygame) - {width}x{height}')
                 
+                # Maximize window on first run
+                try:
+                    # Method 1: Try to maximize using Windows API (if on Windows)
+                    import platform
+                    if platform.system() == "Windows":
+                        try:
+                            import ctypes
+                            
+                            # Get the window handle
+                            hwnd = pygame.display.get_wm_info()['window']
+                            
+                            # Maximize the window
+                            SW_MAXIMIZE = 3
+                            ctypes.windll.user32.ShowWindow(hwnd, SW_MAXIMIZE)
+                            print(f"🔍 [DEBUG] Window maximized using Windows API for monitor {monitor_idx}")
+                        except Exception as e:
+                            print(f"⚠️ [WARNING] Windows API maximize failed: {e}")
+                            # Fallback: try to set window to fullscreen then back to windowed
+                            try:
+                                screen = pygame.display.set_mode((width, height), pygame.RESIZABLE | pygame.FULLSCREEN)
+                                pygame.display.toggle_fullscreen()
+                                print(f"🔍 [DEBUG] Window maximized using fullscreen toggle for monitor {monitor_idx}")
+                            except Exception as e2:
+                                print(f"⚠️ [WARNING] Fullscreen toggle failed: {e2}")
+                    else:
+                        # For non-Windows systems, try fullscreen toggle
+                        try:
+                            screen = pygame.display.set_mode((width, height), pygame.RESIZABLE | pygame.FULLSCREEN)
+                            pygame.display.toggle_fullscreen()
+                            print(f"🔍 [DEBUG] Window maximized using fullscreen toggle for monitor {monitor_idx}")
+                        except Exception as e:
+                            print(f"⚠️ [WARNING] Fullscreen toggle failed: {e}")
+                except Exception as e:
+                    print(f"⚠️ [WARNING] Could not maximize window: {e}")
+                    # Final fallback: just use the window as created
+                    print(f"🔍 [DEBUG] Using window as created for monitor {monitor_idx}")
+                
                 # Enhanced features
                 clock = pygame.time.Clock()
                 running = True
-                current_idx = 0
+                # Initialize current_idx to latest index or first available
+                if latest_index is not None and latest_index in cls._image_index_map:
+                    current_idx = latest_index
+                    print(f"🔍 [DEBUG] Using latest index: {current_idx}")
+                else:
+                    current_idx = min(cls._image_index_map.keys()) if cls._image_index_map else 1
+                    print(f"🔍 [DEBUG] Using first available index: {current_idx}")
+                
+                # Number input system for quick jump
+                number_input = ""  # Current number input string
+                number_input_timer = 0  # Timer for clearing number input
+                number_input_timeout = 2000  # 2 seconds timeout
+                number_input_active = False  # Whether number input is active
+                
+                def handle_number_input(key):
+                    """Handle number input for quick jump"""
+                    nonlocal number_input, number_input_timer, number_input_active, current_idx
+                    
+                    if key >= pygame.K_0 and key <= pygame.K_9:
+                        # Number key pressed
+                        digit = str(key - pygame.K_0)
+                        number_input += digit
+                        number_input_timer = 0
+                        number_input_active = True
+                        print(f"🔍 [DEBUG] Number input: {number_input}")
+                        
+                        # Check if we have a valid number (auto-jump for single digits)
+                        if number_input:
+                            try:
+                                target_idx = int(number_input)
+                                if target_idx in cls._image_index_map:
+                                    current_idx = target_idx
+                                    print(f"🔍 [DEBUG] Jumped to image {current_idx}")
+                                    # For single digits, clear immediately. For multi-digits, wait for Enter
+                                    if len(number_input) == 1:
+                                        number_input = ""
+                                        number_input_active = False
+                                elif len(number_input) >= 3:  # If we have 3+ digits and it's not valid, clear
+                                    print(f"🔍 [DEBUG] Invalid index {target_idx}, clearing input")
+                                    number_input = ""
+                                    number_input_active = False
+                            except ValueError:
+                                pass
+                    elif key == pygame.K_RETURN or key == pygame.K_KP_ENTER:
+                        # Enter pressed - try to jump to the number
+                        if number_input:
+                            try:
+                                target_idx = int(number_input)
+                                if target_idx in cls._image_index_map:
+                                    current_idx = target_idx
+                                    print(f"🔍 [DEBUG] Jumped to image {current_idx}")
+                                else:
+                                    print(f"🔍 [DEBUG] Invalid index {target_idx}")
+                                number_input = ""
+                                number_input_active = False
+                            except ValueError:
+                                number_input = ""
+                                number_input_active = False
+                    elif key == pygame.K_ESCAPE:
+                        # Escape pressed - clear input
+                        number_input = ""
+                        number_input_active = False
+                
+                # Try to maximize window after creation
+                try:
+                    # Method 1: Try to set window to fullscreen then back to windowed
+                    screen = pygame.display.set_mode((width, height), pygame.RESIZABLE | pygame.FULLSCREEN)
+                    pygame.display.toggle_fullscreen()
+                    print(f"🔍 [DEBUG] Window maximized using fullscreen toggle for monitor {monitor_idx}")
+                except Exception as e:
+                    print(f"⚠️ [WARNING] Could not maximize window: {e}")
+                    # Method 2: Try to resize window to monitor resolution
+                    try:
+                        screen = pygame.display.set_mode((width, height), pygame.RESIZABLE)
+                        print(f"🔍 [DEBUG] Window resized to monitor resolution for monitor {monitor_idx}")
+                    except Exception as e2:
+                        print(f"⚠️ [WARNING] Could not resize window: {e2}")
                 
                 # Ensure settings is always defined before using it
                 if settings is None:
@@ -797,8 +1058,6 @@ class HybridPreviewMonitor:
                 last_mouse_pos = (0, 0)
                 
                 # Data refresh tracking
-                last_images = images
-                last_compare_images = compare_images
                 last_settings = settings
                 
                 # Slideshow timing
@@ -815,6 +1074,14 @@ class HybridPreviewMonitor:
                 while running:
                     loop_count += 1
                     
+                    # Update number input timer
+                    if number_input_active:
+                        number_input_timer += clock.get_time()
+                        if number_input_timer >= number_input_timeout:
+                            number_input = ""
+                            number_input_active = False
+                            print(f"🔍 [DEBUG] Number input timeout, cleared")
+                    
                     # Check if window should be closed
                     if monitor_idx in cls._windows and not cls._windows[monitor_idx]["visible"]:
                         running = False
@@ -825,17 +1092,15 @@ class HybridPreviewMonitor:
                         with cls._windows[monitor_idx]["lock"]:
                             window_data = cls._windows[monitor_idx]
                             if (window_data.get("refresh_needed", False) or 
-                                window_data.get("images") != last_images or
-                                window_data.get("compare_images") != last_compare_images or
                                 window_data.get("settings") != last_settings):
                                 
-                                images = window_data.get("images", images)
-                                compare_images = window_data.get("compare_images", compare_images)
                                 new_settings = window_data.get("settings", settings)
                                 if new_settings is not None:
                                     settings = new_settings
-                                current_idx = window_data.get("current_idx", 0)
-                                display_mode = settings.get('display_mode', 'single') if settings else 'single'
+                                new_current_idx = window_data.get("current_idx", current_idx)
+                                if new_current_idx != current_idx:
+                                    current_idx = new_current_idx
+                                    print(f"🔍 [DEBUG] Updated current_idx to: {current_idx}")
                                 
                                 # Check if resolution changed and recreate window if needed
                                 new_target_resolution = settings.get('target_resolution', '1920x1080')
@@ -851,8 +1116,6 @@ class HybridPreviewMonitor:
                                     print(f"⚠️ [WARNING] Could not parse target resolution {new_target_resolution}: {e}")
                                 
                                 # Update tracking variables
-                                last_images = images
-                                last_compare_images = compare_images
                                 last_settings = settings
                                 
                                 # Clear refresh flag
@@ -860,29 +1123,44 @@ class HybridPreviewMonitor:
                                 
                     for event in pygame.event.get():
                         if event.type == pygame.QUIT:
+                            print(f"🔍 [DEBUG] Window {monitor_idx} received QUIT event")
                             running = False
+                            break
                         elif event.type == pygame.KEYDOWN:
                             # Check for modifier keys
                             ctrl_pressed = pygame.key.get_pressed()[pygame.K_LCTRL] or pygame.key.get_pressed()[pygame.K_RCTRL]
                             
-                            if event.key == pygame.K_ESCAPE:
+                            # Handle number input for quick jump
+                            if (event.key >= pygame.K_0 and event.key <= pygame.K_9) or \
+                               event.key == pygame.K_RETURN or event.key == pygame.K_KP_ENTER or \
+                               event.key == pygame.K_ESCAPE:
+                                handle_number_input(event.key)
+                            elif event.key == pygame.K_ESCAPE and not number_input_active:
                                 running = False
-                            elif event.key == pygame.K_SPACE and len(images) > 1:
-                                current_idx = (current_idx + 1) % len(images)
+                            elif event.key == pygame.K_SPACE and len(cls._image_index_map) > 1:
+                                current_idx = cls._get_next_image_index(current_idx, 1)
                                 slideshow_timer = 0  # Reset slideshow timer
+                                print(f"🔍 [DEBUG] Manual advance to image index {current_idx}")
+                            elif event.key == pygame.K_RIGHT and len(cls._image_index_map) > 1:
+                                current_idx = cls._get_next_image_index(current_idx, 1)
+                                slideshow_timer = 0  # Reset slideshow timer
+                                print(f"🔍 [DEBUG] Right arrow: next image index {current_idx}")
+                            elif event.key == pygame.K_LEFT and len(cls._image_index_map) > 1:
+                                current_idx = cls._get_next_image_index(current_idx, -1)
+                                slideshow_timer = 0  # Reset slideshow timer
+                                print(f"🔍 [DEBUG] Left arrow: previous image index {current_idx}")
                             elif event.key == pygame.K_c and ctrl_pressed:
-                                # Toggle comparison mode (only if we have enough images)
-                                if display_mode != 'comparison':
-                                    if len(images) > 1 or (compare_images and len(compare_images) > 0):
-                                        display_mode = 'comparison'
-                                    else:
-                                        print(f"🔍 [DEBUG] Cannot switch to comparison mode: need at least 2 images")
+                                # Toggle comparison mode (only if current image supports it)
+                                current_image_info = cls._get_image_by_index(current_idx)
+                                if current_image_info and current_image_info.get("compare_image"):
+                                    print(f"🔍 [DEBUG] Current image supports comparison mode")
                                 else:
-                                    display_mode = 'single'
+                                    print(f"🔍 [DEBUG] Current image does not support comparison mode")
                             elif event.key == pygame.K_s and ctrl_pressed:
                                 # Toggle slideshow mode
-                                display_mode = 'slideshow' if display_mode != 'slideshow' else 'single'
+                                display_mode = 'slideshow' if display_mode != 'slideshow' else 'multi'
                                 slideshow_timer = 0  # Reset slideshow timer
+                                print(f"🔍 [DEBUG] Toggled slideshow mode to: {display_mode}")
                             elif event.key == pygame.K_r and ctrl_pressed:
                                 # Reset zoom and pan
                                 zoom = 1.0
@@ -921,79 +1199,99 @@ class HybridPreviewMonitor:
                     # Clear screen
                     screen.fill((0, 0, 0))
                     
-                    # Display current image(s)
-                    if images and current_idx < len(images):
+                    # Display current image(s) using queue system
+                    current_image_info = cls._get_image_by_index(current_idx)
+                    if current_image_info:
                         try:
-                            # Get PIL Image from cache
-                            pil_img = cls._image_cache.get(images[current_idx])
-                            if pil_img:
-                                # Convert to pygame surface
-                                img_surface = pygame.image.fromstring(pil_img.tobytes(), pil_img.size, pil_img.mode)
-                                
-                                # Apply zoom and pan
-                                if zoom != 1.0:
-                                    new_size = (int(img_surface.get_width() * zoom), int(img_surface.get_height() * zoom))
-                                    img_surface = pygame.transform.scale(img_surface, new_size)
-                                
-                                # Calculate position with pan
-                                img_rect = img_surface.get_rect()
-                                img_rect.centerx = width // 2 + pan_x
-                                img_rect.centery = height // 2 + pan_y
-                                
-                                # Display image
-                                if display_mode == 'comparison':
-                                    # Comparison mode - split screen with unified resolution
-                                    mouse_x, mouse_y = pygame.mouse.get_pos()
-                                    split_x = mouse_x
+                            # Get main image
+                            main_img_id = current_image_info.get("image")
+                            if main_img_id:
+                                pil_img = cls._image_cache.get(main_img_id)
+                                if pil_img:
+                                    # Convert to pygame surface
+                                    img_surface = pygame.image.fromstring(pil_img.tobytes(), pil_img.size, pil_img.mode)
                                     
-                                    # Get comparison image - try compare_images first, then fallback to next image
-                                    comp_pil_img = None
-                                    if compare_images and len(compare_images) > 0:
-                                        # Use compare_images input
-                                        comp_pil_img = cls._image_cache.get(compare_images[0])
-                                    elif len(images) > 1:
-                                        # Fallback to next image in images list
-                                        next_idx = (current_idx + 1) % len(images)
-                                        comp_pil_img = cls._image_cache.get(images[next_idx])
-                                    if comp_pil_img:
-                                        # Resize comparison image to match main image size
-                                        comp_surface = pygame.image.fromstring(comp_pil_img.tobytes(), comp_pil_img.size, comp_pil_img.mode)
-                                        comp_surface = pygame.transform.scale(comp_surface, img_surface.get_size())
+                                    # Apply zoom and pan
+                                    if zoom != 1.0:
+                                        new_size = (int(img_surface.get_width() * zoom), int(img_surface.get_height() * zoom))
+                                        img_surface = pygame.transform.scale(img_surface, new_size)
+                                    
+                                    # Calculate position with pan
+                                    img_rect = img_surface.get_rect()
+                                    img_rect.centerx = width // 2 + pan_x
+                                    img_rect.centery = height // 2 + pan_y
+                                    
+                                    # Check display mode
+                                    current_display_mode = current_image_info.get("display_mode", "simple")
+                                    
+                                    # Display image
+                                    if current_display_mode == 'comparison':
+                                        # Comparison mode - split screen with unified resolution
+                                        mouse_x, mouse_y = pygame.mouse.get_pos()
+                                        split_x = mouse_x
                                         
-                                        # Apply same zoom and pan to both images
-                                        if zoom != 1.0:
-                                            comp_surface = pygame.transform.scale(comp_surface, new_size)
+                                        # Get comparison image
+                                        comp_img_id = current_image_info.get("compare_image")
+                                        comp_pil_img = None
+                                        if comp_img_id:
+                                            comp_pil_img = cls._image_cache.get(comp_img_id)
                                         
-                                        # Left side - current image
-                                        left_rect = img_rect.copy()
-                                        left_rect.width = split_x
-                                        screen.blit(img_surface, left_rect, (0, 0, split_x - left_rect.x, img_rect.height))
-                                        
-                                        # Right side - comparison image (same size as main image)
-                                        right_rect = img_rect.copy()
-                                        right_rect.x = split_x
-                                        right_rect.width = width - split_x
-                                        screen.blit(comp_surface, right_rect, (split_x - img_rect.x, 0, right_rect.width, img_rect.height))
-                                        
-                                        # Draw split line
-                                        pygame.draw.line(screen, (255, 255, 255), (split_x, 0), (split_x, height), 2)
+                                        if comp_pil_img:
+                                            # Resize comparison image to match main image size
+                                            comp_surface = pygame.image.fromstring(comp_pil_img.tobytes(), comp_pil_img.size, comp_pil_img.mode)
+                                            comp_surface = pygame.transform.scale(comp_surface, img_surface.get_size())
+                                            
+                                            # Apply same zoom and pan to both images
+                                            if zoom != 1.0:
+                                                comp_surface = pygame.transform.scale(comp_surface, new_size)
+                                            
+                                            # Left side - current image
+                                            left_rect = img_rect.copy()
+                                            left_rect.width = split_x
+                                            screen.blit(img_surface, left_rect, (0, 0, split_x - left_rect.x, img_rect.height))
+                                            
+                                            # Right side - comparison image (same size as main image)
+                                            right_rect = img_rect.copy()
+                                            right_rect.x = split_x
+                                            right_rect.width = width - split_x
+                                            screen.blit(comp_surface, right_rect, (split_x - img_rect.x, 0, right_rect.width, img_rect.height))
+                                            
+                                            # Draw split line
+                                            pygame.draw.line(screen, (255, 255, 255), (split_x, 0), (split_x, height), 2)
+                                        else:
+                                            # Fallback to single image if comparison image not available
+                                            screen.blit(img_surface, img_rect)
                                     else:
-                                        # Fallback to single image if comparison image not available
+                                        # Simple mode - single image
                                         screen.blit(img_surface, img_rect)
-                                else:
-                                    # Single image mode
-                                    screen.blit(img_surface, img_rect)
-                                
+                                    
                         except Exception as e:
                             print(f"Error displaying image: {e}")
+                    else:
+                        # No image info available
+                        print(f"🔍 [DEBUG] No image info for index {current_idx}")
+                        # Display "No Image" text
+                        no_image_text = font.render("No Image Available", True, (255, 255, 255))
+                        text_rect = no_image_text.get_rect(center=(width // 2, height // 2))
+                        screen.blit(no_image_text, text_rect)
                     
                     # Draw UI info
-                    info_text = f"Image {current_idx + 1}/{len(images)} | Mode: {display_mode} | Zoom: {zoom:.2f}"
-                    if display_mode == 'comparison':
-                        if compare_images and len(compare_images) > 0:
-                            info_text += " | Compare: External | Mouse to split"
-                        elif len(images) > 1:
-                            info_text += " | Compare: Next image | Mouse to split"
+                    current_image_info = cls._get_image_by_index(current_idx)
+                    current_display_mode = current_image_info.get("display_mode", "simple") if current_image_info else "simple"
+                    
+                    mode_text = "Comparison" if current_display_mode == "comparison" else "Simple"
+                    total_images = len(cls._image_index_map)
+                    # 显示从1开始的索引
+                    display_idx = current_idx
+                    info_text = f"Image {display_idx}/{total_images} | Mode: {mode_text} | Zoom: {zoom:.2f}"
+                    
+                    # Add number input display
+                    if number_input_active:
+                        info_text += f" | Input: {number_input}"
+                    
+                    if current_display_mode == 'comparison':
+                        if current_image_info and current_image_info.get("compare_image"):
+                            info_text += " | Compare: Available | Mouse to split"
                         else:
                             info_text += " | No comparison image available"
                     elif display_mode == 'slideshow':
@@ -1004,8 +1302,8 @@ class HybridPreviewMonitor:
                     
                     # Draw controls
                     controls = [
-                        "ESC: Close | SPACE: Next Image | Ctrl+C: Comparison | Ctrl+S: Slideshow",
-                        "Mouse Wheel: Zoom | Mouse Drag: Pan | Ctrl+R: Reset View"
+                        "ESC: Close | SPACE/→: Next Image | ←: Previous Image | Ctrl+C: Toggle Comparison | Ctrl+S: Toggle Slideshow",
+                        "Mouse Wheel: Zoom | Mouse Drag: Pan | Ctrl+R: Reset View | Numbers: Quick Jump (e.g., 15 for image 15)"
                     ]
                     for i, control in enumerate(controls):
                         control_surface = font.render(control, True, (200, 200, 200))
@@ -1018,13 +1316,25 @@ class HybridPreviewMonitor:
                 
                 # Clean up window data
                 if monitor_idx in cls._windows:
+                    print(f"🔍 [DEBUG] Cleaning up window data for monitor {monitor_idx}")
                     del cls._windows[monitor_idx]
+                    print(f"✅ [DEBUG] Window {monitor_idx} cleaned up successfully")
+                else:
+                    print(f"⚠️ [WARNING] Window data for monitor {monitor_idx} not found during cleanup")
+                
+                # Reset current index to first available
+                if cls._image_index_map:
+                    current_idx = min(cls._image_index_map.keys())
                 
             except Exception as e:
                 print(f"Enhanced Pygame error: {e}")
                 # Clean up window data on error
                 if monitor_idx in cls._windows:
+                    print(f"🔍 [DEBUG] Cleaning up window data for monitor {monitor_idx} after error")
                     del cls._windows[monitor_idx]
+                    print(f"✅ [DEBUG] Window {monitor_idx} cleaned up after error")
+                else:
+                    print(f"⚠️ [WARNING] Window data for monitor {monitor_idx} not found during error cleanup")
         
         # Create window data
         import threading
@@ -1032,28 +1342,34 @@ class HybridPreviewMonitor:
         
         # Stop existing window if any
         if monitor_idx in cls._windows:
+            print(f"🔍 [DEBUG] Stopping existing window for monitor {monitor_idx}")
             # Set visible to False to stop the existing window
             cls._windows[monitor_idx]["visible"] = False
+            print(f"  - Set visible to False")
             # Wait for the thread to finish
             import time
             if cls._windows[monitor_idx]["thread"].is_alive():
-                cls._windows[monitor_idx]["thread"].join(timeout=2.0)
+                print(f"  - Waiting for thread to finish...")
+                cls._windows[monitor_idx]["thread"].join(timeout=3.0)  # Increased timeout
+                print(f"  - Thread finished")
             else:
                 print(f"  - Thread already finished")
             # Clean up the window data
             del cls._windows[monitor_idx]
+            print(f"✅ [DEBUG] Existing window {monitor_idx} stopped and cleaned up")
+            
+            # Wait a bit to ensure cleanup is complete
+            time.sleep(0.1)
         else:
             print(f"🔍 [DEBUG] No existing window for monitor {monitor_idx}")
         
         cls._windows[monitor_idx] = {
             "thread": threading.Thread(target=pygame_window_thread, daemon=True),
-            "images": images,
-            "compare_images": compare_images,
             "settings": settings,
             "lock": threading.Lock(),
             "visible": True,
             "running": True,
-            "current_idx": 0,
+            "current_idx": latest_index if latest_index is not None else (min(cls._image_index_map.keys()) if cls._image_index_map else 1),
             "refresh_needed": False
         }
         
@@ -1103,7 +1419,19 @@ class HybridPreviewMonitor:
     @classmethod
     def cleanup_all_windows(cls):
         """Clean up all resources"""
+        # Clean up all windows
+        for monitor_idx in list(cls._windows.keys()):
+            if cls._windows[monitor_idx]["thread"].is_alive():
+                cls._windows[monitor_idx]["visible"] = False
+                cls._windows[monitor_idx]["thread"].join(timeout=1.0)
+            del cls._windows[monitor_idx]
+        
+        # Clear image cache and queue
         cls._image_cache.clear()
+        cls._display_queue.clear()
+        cls._image_index_map.clear()
+        cls._next_index = 1
+        
         if cls._server:
             cls._server.shutdown()
             cls._server = None
